@@ -1,0 +1,11 @@
+{
+    "KPlugin": {
+        "Description": "Search the MPD library and play tracks",
+        "EnabledByDefault": true,
+        "Icon": "audio-x-generic",
+        "License": "GPL",
+        "Name": "MPD",
+        "Version": "0.1"
+    },
+    "X-Plasma-API-Minimum-Version": "2.0"
+}
