@@ -18,6 +18,7 @@ namespace
 constexpr int MaxResults = 20;
 constexpr int IndexCheckIntervalMs = 5000;
 const QString Prefix = QStringLiteral("mpd ");
+const QString QueuePrefix = QStringLiteral("q ");
 
 struct ConnectionDeleter {
     void operator()(mpd_connection *c) const
@@ -67,6 +68,7 @@ MpdRunner::MpdRunner(QObject *parent, const KPluginMetaData &metaData)
     setMinLetterCount(3);
     addSyntax(QStringLiteral(":q:"), i18n("Finds tracks in the MPD library matching :q:"));
     addSyntax(QStringLiteral("mpd :q:"), i18n("Same, but ranks MPD results above other runners"));
+    addSyntax(QStringLiteral("q :q:"), i18n("Queues the track after the current song without skipping to it"));
 }
 
 QString MpdRunner::fold(const QString &s)
@@ -181,9 +183,10 @@ qreal MpdRunner::score(const Track &t, const QStringList &words)
 void MpdRunner::match(KRunner::RunnerContext &context)
 {
     QString query = context.query().trimmed();
-    const bool prefixed = query.startsWith(Prefix, Qt::CaseInsensitive);
+    const bool queueOnly = query.startsWith(QueuePrefix, Qt::CaseInsensitive);
+    const bool prefixed = queueOnly || query.startsWith(Prefix, Qt::CaseInsensitive);
     if (prefixed) {
-        query = query.mid(Prefix.size()).trimmed();
+        query = query.mid(queueOnly ? QueuePrefix.size() : Prefix.size()).trimmed();
     }
     query = fold(query);
     const QStringList words = query.split(QLatin1Char(' '), Qt::SkipEmptyParts);
@@ -223,10 +226,10 @@ void MpdRunner::match(KRunner::RunnerContext &context)
         KRunner::QueryMatch match(this);
         match.setCategoryRelevance(prefixed ? KRunner::QueryMatch::CategoryRelevance::High : KRunner::QueryMatch::CategoryRelevance::Low);
         match.setRelevance(std::min<qreal>(it->score, 1.0));
-        match.setIconName(QStringLiteral("audio-x-generic"));
+        match.setIconName(queueOnly ? QStringLiteral("media-playlist-append") : QStringLiteral("audio-x-generic"));
         match.setText(t.artist.isEmpty() ? t.title : i18nc("track title - artist", "%1 — %2", t.title, t.artist));
         match.setSubtext(t.album);
-        match.setData(QStringList{t.artist, t.album, t.title});
+        match.setData(QVariantList{t.artist, t.album, t.title, queueOnly});
         match.setId(t.artist + QLatin1Char('\x1f') + t.album + QLatin1Char('\x1f') + t.title);
         matches.append(match);
     }
@@ -237,10 +240,12 @@ void MpdRunner::match(KRunner::RunnerContext &context)
 
 void MpdRunner::run(const KRunner::RunnerContext &, const KRunner::QueryMatch &match)
 {
-    const QStringList tags = match.data().toStringList();
-    if (tags.size() != 3) {
+    const QVariantList data = match.data().toList();
+    if (data.size() != 4) {
         return;
     }
+    const QStringList tags{data[0].toString(), data[1].toString(), data[2].toString()};
+    const bool queueOnly = data[3].toBool();
 
     Connection conn = openConnection();
     if (!conn) {
@@ -276,13 +281,13 @@ void MpdRunner::run(const KRunner::RunnerContext &, const KRunner::QueryMatch &m
     mpd_status_free(status);
 
     // Insert right after the current song (or append if nothing is queued as
-    // current), then jump to it.
+    // current), then jump to it unless only queueing.
     const int id = hasCurrent ? mpd_run_add_id_whence(c, uri.constData(), 0, MPD_POSITION_AFTER_CURRENT) : mpd_run_add_id(c, uri.constData());
     if (id < 0) {
         check(c, "add");
         return;
     }
-    if (!mpd_run_play_id(c, id)) {
+    if (!queueOnly && !mpd_run_play_id(c, id)) {
         check(c, "play");
     }
 }

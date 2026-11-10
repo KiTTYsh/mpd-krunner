@@ -6,6 +6,8 @@ inserts it right after the current song and skips to it.
 - Type any part of the artist, album and/or title (3+ characters). Matching is
   case- and accent-insensitive; every word must match somewhere.
 - Prefix with `mpd ` to rank MPD results above other runners.
+- Prefix with `q ` to only queue the track after the current song, without
+  skipping to it (also ranks MPD results first).
 - Connects using `MPD_HOST` / `MPD_PORT` (incl. `password@host`), defaulting to
   localhost:6600. The environment that counts is plasmashell's / krunner's.
 
