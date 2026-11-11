@@ -11,12 +11,19 @@ inserts it right after the current song and skips to it.
 - Connects using `MPD_HOST` / `MPD_PORT` (incl. `password@host`), defaulting to
   localhost:6600. The environment that counts is plasmashell's / krunner's.
 
-The library index (artist/album/title) is cached in memory and reloaded when
-MPD's database update time changes.
+Results show the album's cover (MPD's `albumart`), cached in memory per album.
+Queue-only results get a small "append" emblem on the cover.
+
+By default the library index (artist/album/title) is cached in memory and
+reloaded when MPD's database update time changes. This can be turned off in
+System Settings → Search → KRunner → MPD (configure); queries then go straight
+to MPD as `search` commands. That's fresher, but slower per keystroke, only
+case-insensitive (not accent-insensitive) and limited to ranking the first 500
+songs MPD returns.
 
 ## Build & install
 
-Requires KF6 (Runner, I18n, CoreAddons), ECM and libmpdclient >= 2.20.
+Requires KF6 (Runner, I18n, CoreAddons, Config, KCMUtils), ECM and libmpdclient >= 2.20.
 
     cmake -B build -DCMAKE_INSTALL_PREFIX=/usr
     cmake --build build

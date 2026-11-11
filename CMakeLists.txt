@@ -8,12 +8,15 @@ include(KDEInstallDirs)
 include(KDECMakeSettings)
 include(KDECompilerSettings NO_POLICY_SCOPE)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core)
-find_package(KF6 6.0 REQUIRED COMPONENTS CoreAddons Runner I18n)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets)
+find_package(KF6 6.0 REQUIRED COMPONENTS CoreAddons Runner I18n Config KCMUtils)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MPDCLIENT REQUIRED IMPORTED_TARGET libmpdclient>=2.20)
 
 add_definitions(-DTRANSLATION_DOMAIN=\"krunner_mpd\")
 
 kcoreaddons_add_plugin(krunner_mpd SOURCES src/mpdrunner.cpp INSTALL_NAMESPACE "kf6/krunner")
-target_link_libraries(krunner_mpd KF6::Runner KF6::I18n PkgConfig::MPDCLIENT)
+target_link_libraries(krunner_mpd KF6::Runner KF6::ConfigCore KF6::I18n Qt6::Gui PkgConfig::MPDCLIENT)
+
+kcoreaddons_add_plugin(kcm_krunner_mpd SOURCES src/kcm/mpdrunnerconfig.cpp INSTALL_NAMESPACE "kf6/krunner/kcms")
+target_link_libraries(kcm_krunner_mpd KF6::KCMUtils KF6::ConfigCore KF6::I18n Qt6::Widgets)

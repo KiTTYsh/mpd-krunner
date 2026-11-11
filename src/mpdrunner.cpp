@@ -1,10 +1,19 @@
 #include "mpdrunner.h"
 
+#include <KConfigGroup>
 #include <KLocalizedString>
 #include <KRunner/QueryMatch>
 #include <KRunner/RunnerContext>
 
+#include <QBuffer>
 #include <QDebug>
+#include <QGuiApplication>
+#include <QIcon>
+#include <QIconEngine>
+#include <QImageReader>
+#include <QPainter>
+#include <QPalette>
+#include <QSet>
 
 #include <mpd/client.h>
 
@@ -17,6 +26,13 @@ namespace
 {
 constexpr int MaxResults = 20;
 constexpr int IndexCheckIntervalMs = 5000;
+// Without the index, at most this many songs are fetched per query and ranked.
+constexpr unsigned SearchLimit = 500;
+constexpr int ArtSize = 128;
+constexpr int ArtChunkSize = 1 << 20;
+constexpr qsizetype MaxArtBytes = 32 << 20;
+constexpr qsizetype ArtCacheBytes = 32 << 20;
+const QString UseIndexKey = QStringLiteral("cacheLibrary");
 const QString Prefix = QStringLiteral("mpd ");
 const QString QueuePrefix = QStringLiteral("q ");
 
@@ -60,6 +76,126 @@ QString quote(QString value)
     value.replace(QLatin1Char('"'), QLatin1String("\\\""));
     return QLatin1Char('\'') + value + QLatin1Char('\'');
 }
+
+// Returns the URI of the first song matching the filter expression; empty if
+// there is none or on error.
+QByteArray findUri(mpd_connection *conn, const QString &expression)
+{
+    if (!mpd_search_db_songs(conn, true) || !mpd_search_add_expression(conn, expression.toUtf8().constData()) || !mpd_search_add_window(conn, 0, 1)
+        || !mpd_search_commit(conn)) {
+        check(conn, "find");
+        return {};
+    }
+    QByteArray uri;
+    if (mpd_song *song = mpd_recv_song(conn)) {
+        uri = mpd_song_get_uri(song);
+        mpd_song_free(song);
+    }
+    if (!check(conn, "find") || !mpd_response_finish(conn)) {
+        return {};
+    }
+    return uri;
+}
+
+// Fetches an album's cover through "albumart", scaled down to ArtSize. Returns
+// a null image if the album has none; sets *failed if the connection broke.
+QImage fetchAlbumArt(mpd_connection *conn, const QString &artist, const QString &album, bool *failed)
+{
+    const QByteArray uri = findUri(conn, QStringLiteral("((artist == %1) AND (album == %2))").arg(quote(artist), quote(album)));
+    if (uri.isEmpty()) {
+        *failed = mpd_connection_get_error(conn) != MPD_ERROR_SUCCESS;
+        return {};
+    }
+
+    QByteArray data;
+    QByteArray chunk(ArtChunkSize, Qt::Uninitialized);
+    for (;;) {
+        const int n = mpd_run_albumart(conn, uri.constData(), data.size(), chunk.data(), chunk.size());
+        if (n < 0) {
+            // A missing cover is a server error, which leaves the connection usable.
+            *failed = !mpd_connection_clear_error(conn);
+            return {};
+        }
+        if (n == 0) {
+            break;
+        }
+        data.append(chunk.constData(), n);
+        if (data.size() > MaxArtBytes) {
+            return {};
+        }
+    }
+
+    QBuffer buffer(&data);
+    QImageReader reader(&buffer);
+    const QSize size = reader.size();
+    if (size.width() > ArtSize || size.height() > ArtSize) {
+        reader.setScaledSize(size.scaled(ArtSize, ArtSize, Qt::KeepAspectRatio));
+    }
+    return reader.read();
+}
+
+// Draws a cover image, optionally with a theme icon as an emblem in the corner.
+// match() runs in a worker thread where QPixmap must not be used, so the
+// pixmap is only made when the icon is painted (in the GUI thread).
+class CoverIconEngine : public QIconEngine
+{
+public:
+    CoverIconEngine(const QImage &image, const QString &emblem)
+        : m_image(image)
+        , m_emblem(emblem)
+    {
+    }
+
+    void paint(QPainter *painter, const QRect &rect, QIcon::Mode, QIcon::State) override
+    {
+        QRect target(QPoint(), m_image.size().scaled(rect.size(), Qt::KeepAspectRatio));
+        target.moveCenter(rect.center());
+        painter->save();
+        painter->setRenderHint(QPainter::SmoothPixmapTransform);
+        painter->drawImage(target, m_image);
+        painter->restore();
+        if (!m_emblem.isEmpty()) {
+            // On a backdrop in the theme's window colour, so it stands out from the cover.
+            const int side = std::min(rect.width(), rect.height()) / 2;
+            const QRect corner(rect.right() - side + 1, rect.bottom() - side + 1, side, side);
+            QColor backdrop = QGuiApplication::palette().color(QPalette::Window);
+            backdrop.setAlpha(220);
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing);
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(backdrop);
+            painter->drawRoundedRect(corner, side / 5.0, side / 5.0);
+            painter->restore();
+            QIcon::fromTheme(m_emblem).paint(painter, corner.adjusted(side / 8, side / 8, -side / 8, -side / 8));
+        }
+    }
+
+    QPixmap pixmap(const QSize &size, QIcon::Mode mode, QIcon::State state) override
+    {
+        return scaledPixmap(size, mode, state, 1.0);
+    }
+
+    QPixmap scaledPixmap(const QSize &size, QIcon::Mode mode, QIcon::State state, qreal scale) override
+    {
+        QImage image(size * scale, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent);
+        {
+            QPainter painter(&image);
+            paint(&painter, image.rect(), mode, state);
+        }
+        image.setDevicePixelRatio(scale);
+        return QPixmap::fromImage(image);
+    }
+
+    QIconEngine *clone() const override
+    {
+        return new CoverIconEngine(m_image, m_emblem);
+    }
+
+private:
+    QImage m_image;
+    QString m_emblem;
+};
 }
 
 MpdRunner::MpdRunner(QObject *parent, const KPluginMetaData &metaData)
@@ -69,6 +205,17 @@ MpdRunner::MpdRunner(QObject *parent, const KPluginMetaData &metaData)
     addSyntax(QStringLiteral(":q:"), i18n("Finds tracks in the MPD library matching :q:"));
     addSyntax(QStringLiteral("mpd :q:"), i18n("Same, but ranks MPD results above other runners"));
     addSyntax(QStringLiteral("q :q:"), i18n("Queues the track after the current song without skipping to it"));
+    m_art.setMaxCost(ArtCacheBytes);
+}
+
+void MpdRunner::reloadConfiguration()
+{
+    QMutexLocker lock(&m_mutex);
+    m_useIndex = config().readEntry(UseIndexKey, true);
+    if (!m_useIndex) {
+        m_tracks = {};
+        m_dbUpdate = 0;
+    }
 }
 
 QString MpdRunner::fold(const QString &s)
@@ -106,13 +253,50 @@ bool MpdRunner::loadIndex(mpd_connection *conn, QList<Track> &tracks)
         } else if (qstrcmp(pair->name, albumName) == 0) {
             album = value;
         } else if (qstrcmp(pair->name, titleName) == 0 && !value.isEmpty()) {
-            const QString foldedArtist = fold(artist);
-            const QString foldedTitle = fold(value);
-            tracks.append({artist, album, value, foldedArtist, foldedTitle, foldedArtist + QLatin1Char(' ') + fold(album) + QLatin1Char(' ') + foldedTitle});
+            tracks.append(makeTrack(artist, album, value));
         }
         mpd_return_pair(conn, pair);
     }
     return check(conn, "list") && mpd_response_finish(conn);
+}
+
+bool MpdRunner::searchTracks(mpd_connection *conn, const QStringList &words, QList<Track> &tracks)
+{
+    // "any" also matches other tags and the URI; match() filters those out again.
+    QStringList terms;
+    for (const QString &w : words) {
+        terms.append(QStringLiteral("(any contains %1)").arg(quote(w)));
+    }
+    const QString expression = terms.size() == 1 ? terms.first() : QLatin1Char('(') + terms.join(QLatin1String(" AND ")) + QLatin1Char(')');
+    if (!mpd_search_db_songs(conn, false) || !mpd_search_add_expression(conn, expression.toUtf8().constData())
+        || !mpd_search_add_window(conn, 0, SearchLimit) || !mpd_search_commit(conn)) {
+        return check(conn, "search");
+    }
+
+    QSet<QString> seen;
+    while (mpd_song *song = mpd_recv_song(conn)) {
+        const auto tag = [song](mpd_tag_type type) {
+            return QString::fromUtf8(mpd_song_get_tag(song, type, 0));
+        };
+        const QString title = tag(MPD_TAG_TITLE);
+        const QString artist = tag(MPD_TAG_ARTIST);
+        const QString album = tag(MPD_TAG_ALBUM);
+        mpd_song_free(song);
+        // Like the index, which is grouped by artist/album/title.
+        const QString id = artist + QLatin1Char('\x1f') + album + QLatin1Char('\x1f') + title;
+        if (!title.isEmpty() && !seen.contains(id)) {
+            seen.insert(id);
+            tracks.append(makeTrack(artist, album, title));
+        }
+    }
+    return check(conn, "search") && mpd_response_finish(conn);
+}
+
+MpdRunner::Track MpdRunner::makeTrack(const QString &artist, const QString &album, const QString &title)
+{
+    const QString foldedArtist = fold(artist);
+    const QString foldedTitle = fold(title);
+    return {artist, album, title, foldedArtist, foldedTitle, foldedArtist + QLatin1Char(' ') + fold(album) + QLatin1Char(' ') + foldedTitle};
 }
 
 void MpdRunner::refreshIndex()
@@ -188,6 +372,9 @@ void MpdRunner::match(KRunner::RunnerContext &context)
     if (prefixed) {
         query = query.mid(queueOnly ? QueuePrefix.size() : Prefix.size()).trimmed();
     }
+    // mpd's own search is only case-insensitive, so it gets the words unfolded:
+    // "beyoncé" finds "Beyoncé" either way, "beyonce" reliably only with the index.
+    const QStringList searchWords = query.toCaseFolded().split(QLatin1Char(' '), Qt::SkipEmptyParts);
     query = fold(query);
     const QStringList words = query.split(QLatin1Char(' '), Qt::SkipEmptyParts);
     if (words.isEmpty() || query.size() < 3) {
@@ -201,12 +388,23 @@ void MpdRunner::match(KRunner::RunnerContext &context)
     QList<Hit> hits;
 
     QMutexLocker lock(&m_mutex);
-    refreshIndex();
-    for (qsizetype i = 0; i < m_tracks.size(); ++i) {
+    const bool useIndex = m_useIndex;
+    QList<Track> found;
+    if (useIndex) {
+        refreshIndex();
+    } else {
+        lock.unlock();
+        Connection conn = openConnection();
+        if (!conn || !searchTracks(conn.get(), searchWords, found)) {
+            return;
+        }
+    }
+    const QList<Track> &tracks = useIndex ? m_tracks : found;
+    for (qsizetype i = 0; i < tracks.size(); ++i) {
         if ((i & 0xfff) == 0 && !context.isValid()) {
             return;
         }
-        const Track &t = m_tracks.at(i);
+        const Track &t = tracks.at(i);
         if (!std::all_of(words.cbegin(), words.cend(), [&](const QString &w) {
                 return t.haystack.contains(w);
             })) {
@@ -220,20 +418,61 @@ void MpdRunner::match(KRunner::RunnerContext &context)
         return a.score > b.score;
     });
 
-    QList<KRunner::QueryMatch> matches;
+    QList<std::pair<Track, qreal>> results;
     for (auto it = hits.begin(); it != cut; ++it) {
-        const Track &t = m_tracks.at(it->index);
+        results.append({tracks.at(it->index), it->score});
+    }
+    if (useIndex) {
+        lock.unlock();
+    }
+
+    QMutexLocker artLock(&m_artMutex);
+    Connection artConn;
+    bool artFailed = false;
+    QList<KRunner::QueryMatch> matches;
+    for (const auto &[t, score] : results) {
+        if (!context.isValid()) {
+            return;
+        }
+        QImage cover;
+        const QString artKey = t.artist + QLatin1Char('\x1f') + t.album;
+        if (t.album.isEmpty()) {
+            // No album to show the cover of.
+        } else if (const QImage *cached = m_art.object(artKey)) {
+            cover = *cached;
+        } else if (!artFailed) {
+            if (!artConn) {
+                artConn = openConnection();
+                // Fetch covers in one piece; older servers just keep sending 8 KiB chunks.
+                if (artConn && !mpd_run_binarylimit(artConn.get(), ArtChunkSize)) {
+                    mpd_connection_clear_error(artConn.get());
+                }
+            }
+            artFailed = !artConn;
+            if (artConn) {
+                cover = fetchAlbumArt(artConn.get(), t.artist, t.album, &artFailed);
+            }
+            if (!artFailed) {
+                m_art.insert(artKey, new QImage(cover), cover.sizeInBytes() + 1);
+            }
+        }
+
         KRunner::QueryMatch match(this);
         match.setCategoryRelevance(prefixed ? KRunner::QueryMatch::CategoryRelevance::High : KRunner::QueryMatch::CategoryRelevance::Low);
-        match.setRelevance(std::min<qreal>(it->score, 1.0));
-        match.setIconName(queueOnly ? QStringLiteral("media-playlist-append") : QStringLiteral("audio-x-generic"));
+        match.setRelevance(std::min<qreal>(score, 1.0));
+        const QString iconName = queueOnly ? QStringLiteral("media-playlist-append") : QStringLiteral("audio-x-generic");
+        if (cover.isNull()) {
+            match.setIconName(iconName);
+        } else {
+            match.setIcon(QIcon(new CoverIconEngine(cover, queueOnly ? iconName : QString())));
+        }
         match.setText(t.artist.isEmpty() ? t.title : i18nc("track title - artist", "%1 — %2", t.title, t.artist));
         match.setSubtext(t.album);
         match.setData(QVariantList{t.artist, t.album, t.title, queueOnly});
         match.setId(t.artist + QLatin1Char('\x1f') + t.album + QLatin1Char('\x1f') + t.title);
         matches.append(match);
     }
-    lock.unlock();
+    artLock.unlock();
 
     context.addMatches(matches);
 }
@@ -254,17 +493,8 @@ void MpdRunner::run(const KRunner::RunnerContext &, const KRunner::QueryMatch &m
     mpd_connection *c = conn.get();
 
     const QString expression = QStringLiteral("((artist == %1) AND (album == %2) AND (title == %3))").arg(quote(tags[0]), quote(tags[1]), quote(tags[2]));
-    if (!mpd_search_db_songs(c, true) || !mpd_search_add_expression(c, expression.toUtf8().constData()) || !mpd_search_add_window(c, 0, 1)
-        || !mpd_search_commit(c)) {
-        check(c, "find");
-        return;
-    }
-    QByteArray uri;
-    if (mpd_song *song = mpd_recv_song(c)) {
-        uri = mpd_song_get_uri(song);
-        mpd_song_free(song);
-    }
-    if (!check(c, "find") || !mpd_response_finish(c)) {
+    const QByteArray uri = findUri(c, expression);
+    if (mpd_connection_get_error(c) != MPD_ERROR_SUCCESS) {
         return;
     }
     if (uri.isEmpty()) {
