@@ -29,3 +29,24 @@ Requires KF6 (Runner, I18n, CoreAddons, Config, KCMUtils), ECM and libmpdclient 
     cmake --build build
     sudo cmake --install build
     kquitapp6 krunner   # restarts on next use
+
+## Nix
+
+A flake is included; the package builds both plugins into
+`$out/lib/qt-6/plugins/kf6/krunner{,/kcms}`, which is on `QT_PLUGIN_PATH` once
+it is installed into a profile.
+
+    nix build                  # result/
+    nix develop                # cmake, KF6 deps, clang-tools, mpc
+    nix profile install .      # then: kquitapp6 krunner
+
+On NixOS, add it system-wide via the overlay:
+
+    # flake.nix
+    inputs.krunner-mpd.url = "github:KiTTYsh/mpd-krunner";
+    # configuration.nix
+    nixpkgs.overlays = [ inputs.krunner-mpd.overlays.default ];
+    environment.systemPackages = [ pkgs.krunner-mpd ];
+
+`MPD_HOST` / `MPD_PORT` must be set in plasmashell's environment, e.g. via
+`environment.sessionVariables`.
