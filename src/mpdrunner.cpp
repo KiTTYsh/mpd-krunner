@@ -13,6 +13,7 @@
 #include <QImageReader>
 #include <QPainter>
 #include <QPalette>
+#include <QRegularExpression>
 #include <QSet>
 
 #include <mpd/client.h>
@@ -220,12 +221,15 @@ void MpdRunner::reloadConfiguration()
 
 QString MpdRunner::fold(const QString &s)
 {
-    // Case- and accent-insensitive: "Beyoncé" matches "beyonce".
+    // Case- and accent-insensitive: "Beyoncé" matches "beyonce". Typographic
+    // apostrophes become ASCII ones: "why's" matches "Why’s".
     QString out;
     const QString decomposed = s.normalized(QString::NormalizationForm_KD);
     out.reserve(decomposed.size());
     for (const QChar c : decomposed) {
-        if (c.category() != QChar::Mark_NonSpacing) {
+        if (c == u'\u2018' || c == u'\u2019' || c == u'\u02BC') {
+            out.append(QLatin1Char('\''));
+        } else if (c.category() != QChar::Mark_NonSpacing) {
             out.append(c);
         }
     }
@@ -374,7 +378,10 @@ void MpdRunner::match(KRunner::RunnerContext &context)
     }
     // mpd's own search is only case-insensitive, so it gets the words unfolded:
     // "beyoncé" finds "Beyoncé" either way, "beyonce" reliably only with the index.
-    const QStringList searchWords = query.toCaseFolded().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    // Apostrophes split words, as tags may use a different one: "why's" searches
+    // for "why" and "s", and the folded words below still require the apostrophe.
+    static const QRegularExpression searchSeparators(QStringLiteral("[ '\u2018\u2019\u02BC]+"));
+    const QStringList searchWords = query.toCaseFolded().split(searchSeparators, Qt::SkipEmptyParts);
     query = fold(query);
     const QStringList words = query.split(QLatin1Char(' '), Qt::SkipEmptyParts);
     if (words.isEmpty() || query.size() < 3) {
@@ -394,6 +401,9 @@ void MpdRunner::match(KRunner::RunnerContext &context)
         refreshIndex();
     } else {
         lock.unlock();
+        if (searchWords.isEmpty()) {
+            return;
+        }
         Connection conn = openConnection();
         if (!conn || !searchTracks(conn.get(), searchWords, found)) {
             return;
